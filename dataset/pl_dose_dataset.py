@@ -150,8 +150,9 @@ class ConditionalDoseDataset(Dataset):
     #      Using Prof. Hesser's delta formulation instead of num_photons
     # ========================================================================
     def __init__(self, root_dir, normalize=True, target_dim=None,
-                 delta=None, target_uncertainty=0.10, add_noise=True, 
-                 use_pregenerated_lp=True, lp_folder: str = "lp_cubes"):
+                 delta=None, target_uncertainty=0.10, add_noise=True,
+                 use_pregenerated_lp=True, lp_folder: str = "lp_cubes",
+                 dose_scale: float = 0.02):
         """
         Diff-MC style dataset for Monte Carlo dose denoising.
         
@@ -183,56 +184,65 @@ class ConditionalDoseDataset(Dataset):
         self.add_noise = add_noise
         self.use_pregenerated_lp = use_pregenerated_lp  # Date: 2025-12-03
         self.lp_folder = lp_folder
+        self.dose_scale = float(dose_scale)
 
-        beam_folders = sorted(os.listdir(root_dir))
-        for beam_folder in tqdm(beam_folders, desc="Indexing dataset"):
-            # Check for 'output' folder, if not present, assume direct structure
-            beam_path_output = os.path.join(root_dir, beam_folder, "output")
-            if os.path.isdir(beam_path_output):
-                 beam_path = beam_path_output
-            else:
-                 beam_path = os.path.join(root_dir, beam_folder)
+        # ====================================================================
+        # Date: 2026-01-06: Support FLAT structure (patient_id/input_cubes)
+        # The dataset can have two structures:
+        #   1. NESTED: energy/batch_id/input_cubes/*.npy (original)
+        #   2. FLAT:   patient_id/input_cubes/*.npy (current data)
+        # We detect this by checking if folders contain input_cubes directly
+        # ====================================================================
+        patient_folders = sorted(os.listdir(root_dir))
+        for patient_folder in tqdm(patient_folders, desc="Indexing dataset"):
+            patient_path = os.path.join(root_dir, patient_folder)
             
-            if not os.path.isdir(beam_path):
+            if not os.path.isdir(patient_path):
                 continue
-
-            try:
-                energy = float(beam_folder.replace("_", "."))
-            except ValueError:
-                continue
-
-            for batch_id in os.listdir(beam_path):
-                batch_path = os.path.join(beam_path, batch_id)
-                if not os.path.isdir(batch_path):
-                    continue
+            
+            # Check if this folder directly contains input_cubes (FLAT structure)
+            input_path = os.path.join(patient_path, "input_cubes")
+            output_path = os.path.join(patient_path, "output_cubes")
+            lp_path = os.path.join(patient_path, self.lp_folder)
+            
+            if os.path.isdir(input_path) and os.path.isdir(output_path):
+                # FLAT structure: patient_id/input_cubes/*.npy
+                energy = 0.0  # Default energy for this dataset
                 
-                # ============================================================
-                # Date: 2025-12-03 - Define paths for CT, HP, and LP
-                # ============================================================
-                input_path = os.path.join(batch_path, "input_cubes")   # CT
-                output_path = os.path.join(batch_path, "output_cubes") # HP dose
-                lp_path = os.path.join(batch_path, self.lp_folder)     # LP dose
-
                 input_files = sorted(glob.glob(os.path.join(input_path, "*.npy")))
                 for file in input_files:
                     filename = os.path.basename(file)
-                    ct_file = os.path.join(input_path, filename)       # CT
-                    hp_file = os.path.join(output_path, filename)      # HP dose
-                    lp_file = os.path.join(lp_path, filename)          # LP dose
+                    ct_file = os.path.join(input_path, filename)
+                    hp_file = os.path.join(output_path, filename)
+                    lp_file = os.path.join(lp_path, filename)
                     
-                    # Check if HP dose exists (required)
-                    if not os.path.exists(hp_file):
+                    # Skip file existence check for speed - assume LP exists
+                    self.data.append((ct_file, hp_file, lp_file, energy))
+            else:
+                # NESTED structure: energy/batch_id/input_cubes/*.npy
+                try:
+                    energy = float(patient_folder.replace("_", "."))
+                except ValueError:
+                    continue
+                
+                for batch_id in os.listdir(patient_path):
+                    batch_path = os.path.join(patient_path, batch_id)
+                    if not os.path.isdir(batch_path):
                         continue
                     
-                    # Check if LP dose exists (if using pre-generated)
-                    if self.use_pregenerated_lp and not os.path.exists(lp_file):
-                        # LP file doesn't exist, skip or warn
-                        print(f"Warning: LP dose not found: {lp_file}")
-                        print("Run generate_lp_dose.py first, or set use_pregenerated_lp=False")
-                        lp_file = None
-                    
-                    # Store paths: (CT, HP, LP, energy)
-                    self.data.append((ct_file, hp_file, lp_file, energy))
+                    input_path = os.path.join(batch_path, "input_cubes")
+                    output_path = os.path.join(batch_path, "output_cubes")
+                    lp_path = os.path.join(batch_path, self.lp_folder)
+
+                    input_files = sorted(glob.glob(os.path.join(input_path, "*.npy")))
+                    for file in input_files:
+                        filename = os.path.basename(file)
+                        ct_file = os.path.join(input_path, filename)
+                        hp_file = os.path.join(output_path, filename)
+                        lp_file = os.path.join(lp_path, filename)
+                        
+                        # Skip file existence check for speed
+                        self.data.append((ct_file, hp_file, lp_file, energy))
 
     def __len__(self):
         return len(self.data)
@@ -298,13 +308,26 @@ class ConditionalDoseDataset(Dataset):
             # No noise (for testing/ablation)
             lp_dose = hp_dose.copy()
         
-        # ====================================================================
+            # ====================================================================
         # Normalize each volume (z-score normalization)
+        # IMPORTANT: Store normalization stats for un-normalization in testing
+        # 
+        # CRITICAL FIX: Only normalize CT, keep dose in physical units!
+        # Why: Per-sample dose normalization loses absolute scale information.
+        # The model cannot learn the relationship between dose values across samples.
         # ====================================================================
+        hp_mean = hp_dose.mean()
+        hp_std = hp_dose.std() + 1e-8
+        
         if self.normalize:
+            # Normalize CT (HU values)
             ct_vol = (ct_vol - ct_vol.mean()) / (ct_vol.std() + 1e-5)
-            lp_dose = (lp_dose - lp_dose.mean()) / (lp_dose.std() + 1e-5)
-            hp_dose = (hp_dose - hp_dose.mean()) / (hp_dose.std() + 1e-5)
+            
+            # Scale dose to [0, 1] range using a fixed global max
+            # Typical dose range: 0 to ~0.01 Gy
+            # Use 0.02 as safe upper bound
+            lp_dose = np.clip(lp_dose / self.dose_scale, 0, 1)
+            hp_dose = np.clip(hp_dose / self.dose_scale, 0, 1)
 
         # ====================================================================
         # Convert to PyTorch tensors
@@ -328,6 +351,7 @@ class ConditionalDoseDataset(Dataset):
         #   - "ct": CT volume for anatomical context
         #   - "lp_dose": Low-Photon dose (noisy input to be denoised)
         #   - "energy": Beam energy in keV
+        #   - "hp_mean", "hp_std": For un-normalization in testing
         #
         # Model architectures can use this in different ways:
         #   1. Concatenate [CT, LP] as 2-channel input
@@ -337,7 +361,10 @@ class ConditionalDoseDataset(Dataset):
         condition = {
             "ct": ct_tensor,                                    # [1, D, H, W] - Anatomy
             "lp_dose": lp_tensor,                               # [1, D, H, W] - Noisy input
-            "energy": torch.tensor([energy], dtype=torch.float32)  # [1] - Beam energy
+            "energy": torch.tensor([energy], dtype=torch.float32),  # [1] - Beam energy
+            "hp_mean": torch.tensor([hp_mean], dtype=torch.float32),  # For un-normalization
+            "hp_std": torch.tensor([hp_std], dtype=torch.float32),    # For un-normalization
+            "dose_scale": torch.tensor([self.dose_scale], dtype=torch.float32),
         }
 
         # ====================================================================
