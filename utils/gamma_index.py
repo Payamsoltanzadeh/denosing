@@ -1,12 +1,11 @@
 # ============================================================================
 # utils/gamma_index.py
 # ============================================================================
-# Purpose: Calculate Gamma Index for Dose Distributions using pymedphys.
+# Purpose: Calculate Gamma Index for Dose Distributions.
 #          Standard metric in Medical Physics (e.g., 3%/3mm).
 # ============================================================================
 
 import numpy as np
-import pymedphys
 
 def calculate_gamma_index_3d(
     reference, 
@@ -17,53 +16,48 @@ def calculate_gamma_index_3d(
     threshold_percent=10.0
 ):
     """
-    Calculate 3D Gamma Index using pymedphys (Gold Standard).
+    FAST Gamma Index calculation (Dose-Difference only approximation).
+    
+    The full 3D Gamma with DTA is extremely slow on CPU.
+    This uses a dose-difference-only approximation which is:
+    - Much faster (numpy vectorized)
+    - Conservative (underestimates pass rate slightly)
+    - Suitable for training/validation feedback
+    
+    For final publication results, use pymedphys.gamma separately.
     
     Args:
         reference (np.ndarray): Reference dose (Ground Truth).
         evaluated (np.ndarray): Evaluated dose (Prediction).
-        dta_mm (float): Distance-to-Agreement threshold in mm (default 3mm).
+        dta_mm (float): Distance-to-Agreement threshold in mm (not used in fast mode).
         dd_percent (float): Dose Difference threshold in % (default 3%).
-        pixel_spacing_mm (tuple): Voxel size in mm (z, y, x).
-        threshold_percent (float): Lower dose threshold to exclude background (default 10% of max).
+        pixel_spacing_mm (tuple): Voxel size in mm (not used in fast mode).
+        threshold_percent (float): Lower dose threshold to exclude background.
         
     Returns:
-        gamma_map (np.ndarray): 3D Gamma map.
+        gamma_map (np.ndarray): Approximate Gamma map (DD-only).
         pass_rate (float): Percentage of points with Gamma <= 1.
     """
+    max_dose = np.max(reference)
+    if max_dose < 1e-10:
+        return np.zeros_like(reference), 100.0
     
-    # Construct axes based on pixel spacing
-    # Assuming origin at (0,0,0) for relative comparison
-    z_vals = np.arange(reference.shape[0]) * pixel_spacing_mm[0]
-    y_vals = np.arange(reference.shape[1]) * pixel_spacing_mm[1]
-    x_vals = np.arange(reference.shape[2]) * pixel_spacing_mm[2]
+    # Dose difference threshold in absolute units
+    dd_abs = (dd_percent / 100.0) * max_dose
+    threshold_val = (threshold_percent / 100.0) * max_dose
     
-    axes = (z_vals, y_vals, x_vals)
+    # Mask for valid dose region
+    mask = reference > threshold_val
     
-    # Calculate Gamma
-    # Note: pymedphys.gamma can be slow for large 3D volumes.
-    # We use global gamma (local_gamma=False) which normalizes to max dose of reference.
-    gamma = pymedphys.gamma(
-        axes_reference=axes,
-        dose_reference=reference,
-        axes_evaluation=axes,
-        dose_evaluation=evaluated,
-        dose_percent_threshold=dd_percent,
-        distance_mm_threshold=dta_mm,
-        lower_percent_dose_cutoff=threshold_percent,
-        interp_fraction=10, # 10x interpolation for accuracy
-        max_gamma=2.0,      # Stop calculating if gamma > 2
-        local_gamma=False,  # Global normalization (standard)
-        quiet=True
-    )
+    if np.sum(mask) == 0:
+        return np.zeros_like(reference), 100.0
     
-    # Calculate Pass Rate
-    # Valid points are those where gamma was calculated (not NaN)
-    valid_mask = ~np.isnan(gamma)
-    if np.sum(valid_mask) == 0:
-        return gamma, 0.0
-        
-    pass_rate = np.sum(gamma[valid_mask] <= 1.0) / np.sum(valid_mask) * 100.0
+    # Calculate dose difference (normalized to threshold)
+    diff = np.abs(reference - evaluated)
+    gamma = diff / (dd_abs + 1e-10)
+    
+    # Pass rate: fraction of masked voxels with gamma <= 1
+    pass_rate = np.sum(gamma[mask] <= 1.0) / np.sum(mask) * 100.0
     
     return gamma, pass_rate
 

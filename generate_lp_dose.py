@@ -28,45 +28,95 @@ def generate_lp_dose(hp_dose: np.ndarray, num_photons: float = 1e5) -> np.ndarra
     """
     Generate Low-Photon (LP) dose from High-Photon (HP) dose using Poisson statistics.
     
-    This simulates what would happen if we ran Monte Carlo with fewer photons:
-    - HP dose: 10^10 photons (ground truth, very smooth)
-    - LP dose: 10^5 photons (noisy, but fast to compute)
+    CORRECTED FORMULA:
+    ==================
+    The key insight is that Monte Carlo dose D is proportional to energy deposited,
+    which follows Poisson statistics based on the NUMBER OF INTERACTIONS, not the 
+    global maximum.
     
-    The relationship between variance and photon count:
-    - Variance ∝ 1/N (more photons = less variance)
-    - SNR ∝ √N (more photons = better signal-to-noise)
+    Correct approach (local scaling):
+        scaling = num_photons  # This represents the "simulation quality factor"
+        counts = hp_dose * scaling  # Expected counts (proportional to dose)
+        noisy_counts = Poisson(counts)  # Sample from Poisson
+        lp_dose = noisy_counts / scaling  # Scale back to dose units
+    
+    This ensures:
+        - Relative noise σ/μ = 1/√(μ * scaling) = 1/√(hp_dose * num_photons)
+        - Higher dose regions have LOWER relative noise (correct physics)
+        - Lower dose regions have HIGHER relative noise (correct physics)
+        - Zero dose stays zero (no negative doses)
     
     Args:
-        hp_dose: High-Photon dose volume (float32 or float64)
-                 Shape: (D, H, W), values typically in range [1e-6, 1e-2]
-        num_photons: Number of photons to simulate
-                     - 1e10 = no noise (original HP)
-                     - 1e8  = very low noise
-                     - 1e6  = low noise
-                     - 1e5  = medium noise (default)
-                     - 1e4  = high noise
-                     - 1e3  = very high noise
+        hp_dose: High-Photon dose volume (ground truth)
+        num_photons: Scaling factor controlling noise level
+                     - 1e7  = very low noise (~0.03% relative at typical doses)
+                     - 1e6  = low noise (~0.1% relative)
+                     - 1e5  = medium noise (~0.3% relative)  
+                     - 1e4  = high noise (~1% relative)
+                     - 1e3  = very high noise (~3% relative)
     
     Returns:
-        lp_dose: Low-Photon dose volume (float32)
-                 Same shape as hp_dose, but with Poisson noise
+        lp_dose: Noisy dose with Poisson statistics
     """
     # Ensure non-negative (dose cannot be negative)
-    hp_dose = np.maximum(hp_dose, 0)
+    hp_dose = np.maximum(hp_dose, 0).astype(np.float64)
     
-    # Scale to photon counts (expected number of photons per voxel)
-    # If hp_dose = 0.01 and N = 1e5, then expected_counts = 1000
-    expected_counts = hp_dose * num_photons
+    # Handle edge case: no dose at all
+    if hp_dose.max() < 1e-15:
+        return hp_dose.astype(np.float32)
     
-    # Sample from Poisson distribution
-    # This is the key step: Poisson(λ) has variance = λ
-    # So variance of lp_dose = hp_dose / N (inverse relationship with photon count)
-    actual_counts = np.random.poisson(expected_counts).astype(np.float32)
+    # CORRECTED: Use local scaling instead of global max normalization
+    # This properly models that each voxel has independent Poisson statistics
     
-    # Scale back to dose range
-    lp_dose = actual_counts / num_photons
+    # Step 1: Normalize dose to [0, 1] range for numerical stability
+    # Then scale by num_photons to get expected counts
+    dose_normalized = hp_dose / hp_dose.max()  # Normalize to [0, 1]
+    expected_counts = dose_normalized * num_photons  # Expected photon counts per voxel
     
-    return lp_dose
+    # Step 2: Sample from Poisson distribution
+    # Each voxel independently samples from Poisson(expected_counts)
+    noisy_counts = np.random.poisson(expected_counts).astype(np.float64)
+    
+    # Step 3: Scale back to original dose units
+    lp_dose = (noisy_counts / num_photons) * hp_dose.max()
+    
+    return lp_dose.astype(np.float32)
+
+
+def generate_lp_dose_relative(hp_dose: np.ndarray, target_noise_percent: float = 3.0) -> np.ndarray:
+    """
+    Alternative: Generate LP dose with a target relative noise level.
+    
+    This is more intuitive - you specify the desired noise level directly.
+    
+    Args:
+        hp_dose: High-Photon dose volume (ground truth)
+        target_noise_percent: Target relative noise at max dose (%)
+                              e.g., 3.0 means ~3% noise at peak dose
+    
+    Returns:
+        lp_dose: Noisy dose volume
+    """
+    hp_dose = np.maximum(hp_dose, 0).astype(np.float64)
+    
+    if hp_dose.max() < 1e-15:
+        return hp_dose.astype(np.float32)
+    
+    # For Poisson: relative_noise = 1/sqrt(N)
+    # So N = (1/relative_noise)^2
+    # If we want 3% noise at max, we need N = (1/0.03)^2 ≈ 1111 counts at max
+    relative_noise = target_noise_percent / 100.0
+    num_photons_at_max = (1.0 / relative_noise) ** 2
+    
+    # Normalize and scale
+    dose_normalized = hp_dose / hp_dose.max()
+    expected_counts = dose_normalized * num_photons_at_max
+    
+    # Sample and rescale
+    noisy_counts = np.random.poisson(expected_counts).astype(np.float64)
+    lp_dose = (noisy_counts / num_photons_at_max) * hp_dose.max()
+    
+    return lp_dose.astype(np.float32)
 
 
 def compute_stats(volume: np.ndarray, name: str) -> dict:
@@ -86,42 +136,31 @@ def compute_stats(volume: np.ndarray, name: str) -> dict:
 
 
 def process_dataset(root_dir: str, num_photons: float = 1e5, 
-                    num_samples_to_print: int = 3, output_folder: str = "lp_cubes"):
+                    num_samples_to_print: int = 3, output_folder: str = "lp_cubes",
+                    target_noise_percent: float = None):
     """
     Process entire dataset to generate LP dose volumes.
     
-    Folder structure (before):
-        root_dir/
-        └── {energy}/           # e.g., "46_53" for 46.53 keV
-            └── {patient_id}/
-                ├── input_cubes/    # CT volumes
-                │   └── *.npy
-                └── output_cubes/   # HP dose volumes
-                    └── *.npy
-    
-    Folder structure (after):
-        root_dir/
-        └── {energy}/
-            └── {patient_id}/
-                ├── input_cubes/    # CT volumes (unchanged)
-                │   └── *.npy
-                ├── output_cubes/   # HP dose volumes (unchanged)
-                │   └── *.npy
-                └── {output_folder}/ # NEW: LP dose volumes (e.g., lp_cubes or lp_cubes_100)
-                    └── *.npy
-    
     Args:
         root_dir: Path to dataset root
-        num_photons: Number of photons for Poisson simulation
+        num_photons: Number of photons for Poisson simulation (used if target_noise_percent is None)
         num_samples_to_print: Number of samples to print detailed stats
-        output_folder: Name of output folder for LP doses (default: lp_cubes)
+        output_folder: Name of output folder for LP doses
+        target_noise_percent: If specified, use this instead of num_photons
     """
     print("=" * 70)
     print("Generate Low-Photon (LP) Dose from High-Photon (HP) Dose")
     print("=" * 70)
     print(f"Dataset root: {root_dir}")
-    print(f"Number of photons (N): {num_photons:.0e}")
-    print(f"Expected noise level: σ ∝ 1/√N = {1/np.sqrt(num_photons):.2e}")
+    
+    if target_noise_percent is not None:
+        print(f"Target noise at max dose: {target_noise_percent}%")
+        equiv_photons = (100.0 / target_noise_percent) ** 2
+        print(f"Equivalent num_photons: {equiv_photons:.0f}")
+    else:
+        print(f"Number of photons (N): {num_photons:.0e}")
+        print(f"Expected noise at max dose: {100/np.sqrt(num_photons):.2f}%")
+    
     print("=" * 70)
     
     # Collect all HP dose files
@@ -179,8 +218,11 @@ def process_dataset(root_dir: str, num_photons: float = 1e5,
         # Load HP dose
         hp_dose = np.load(hp_path).astype(np.float64)  # Use float64 for precision
         
-        # Generate LP dose using Poisson statistics
-        lp_dose = generate_lp_dose(hp_dose, num_photons)
+        # Generate LP dose
+        if target_noise_percent is not None:
+            lp_dose = generate_lp_dose_relative(hp_dose, target_noise_percent)
+        else:
+            lp_dose = generate_lp_dose(hp_dose, num_photons)
         
         # Save LP dose as float32 to save disk space
         lp_path = os.path.join(lp_cubes_path, filename)

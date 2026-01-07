@@ -31,6 +31,7 @@ from scipy.ndimage import gaussian_filter, median_filter
 from models.simple_unet_denoiser import get_simple_denoiser
 from dataset.pl_dose_dataset import ConditionalDoseDataset
 from utils.gamma_index import calculate_gamma_index_3d
+from utils.torch_gaussian import get_gaussian_layer
 
 
 # ============================================================================
@@ -126,55 +127,28 @@ def compute_metrics_by_dose_regime(reference, evaluated, thresholds=(0.1, 0.5)):
 # ============================================================================
 # NEW: Classical Filter Baselines (Hesser request)
 # ============================================================================
-def apply_gaussian_filter(volume, sigma=1.0):
+def apply_gaussian_filter_gpu(volume_tensor, gaussian_layer, device):
     """
-    Apply 3D Gaussian filter for baseline comparison.
+    Apply 3D Gaussian filter on GPU for FAST baseline comparison.
     This is the "linear denoising filter" Hesser mentioned.
     
     Args:
-        volume: 3D dose volume
-        sigma: Standard deviation of Gaussian kernel
+        volume_tensor: 3D dose volume as torch tensor [1, D, H, W]
+        gaussian_layer: Pre-initialized GaussianBlur3D layer
+        device: torch device
     
     Returns:
-        Smoothed volume
+        Smoothed volume as numpy array
     """
-    return gaussian_filter(volume, sigma=sigma)
-
-
-def apply_bilateral_filter_approx(volume, sigma_spatial=1.0, sigma_intensity=None):
-    """
-    Approximate bilateral filter for 3D volumes.
-    Bilateral filter is edge-preserving (non-linear).
-    
-    True 3D bilateral is slow, this is a fast approximation using:
-    - Gaussian smoothing for spatial component
-    - Gradient-based weighting for edge preservation
-    
-    Args:
-        volume: 3D dose volume
-        sigma_spatial: Spatial smoothing strength
-        sigma_intensity: Intensity smoothing (auto-computed if None)
-    
-    Returns:
-        Edge-preserving smoothed volume
-    """
-    if sigma_intensity is None:
-        sigma_intensity = np.std(volume) * 0.5
-    
-    # Gaussian filtered version
-    gaussian_filtered = gaussian_filter(volume, sigma=sigma_spatial)
-    
-    # Median filtered version (for edge preservation)
-    median_filtered = median_filter(volume, size=3)
-    
-    # Blend based on local gradient (edge-aware)
-    gradient = np.abs(volume - gaussian_filtered)
-    alpha = np.exp(-gradient / (sigma_intensity + 1e-10))
-    
-    # Blend: high alpha → use Gaussian, low alpha → use Median (edge)
-    result = alpha * gaussian_filtered + (1 - alpha) * median_filtered
-    
-    return result
+    with torch.no_grad():
+        if volume_tensor.dim() == 3:
+            volume_tensor = volume_tensor.unsqueeze(0).unsqueeze(0)  # [1, 1, D, H, W]
+        elif volume_tensor.dim() == 4:
+            volume_tensor = volume_tensor.unsqueeze(1)  # [1, 1, D, H, W]
+        
+        volume_tensor = volume_tensor.to(device)
+        filtered = gaussian_layer(volume_tensor)
+        return filtered.squeeze().cpu().numpy()
 
 
 # ============================================================================
@@ -308,10 +282,12 @@ def test(args):
         root_dir=args.root_dir,
         normalize=True,  # Model expects normalized input
         target_dim=64,
-        num_photons=1e3,
+        delta=None,
+        target_uncertainty=0.10,
         add_noise=False,
         use_pregenerated_lp=True,
         lp_folder=args.lp_folder,
+        dose_scale=args.dose_scale,
     )
     
     # Dataset for METRICS (raw, physical units)
@@ -319,10 +295,12 @@ def test(args):
         root_dir=args.root_dir,
         normalize=False,  # RAW physical dose for metrics!
         target_dim=64,
-        num_photons=1e3,
+        delta=None,
+        target_uncertainty=0.10,
         add_noise=False,
         use_pregenerated_lp=True,
         lp_folder=args.lp_folder,
+        dose_scale=args.dose_scale,
     )
     
     print(f"   Loaded {len(dataset_norm)} samples")
@@ -345,12 +323,19 @@ def test(args):
     
     model.eval()
     
+    # Create Gaussian blur layer for inference (matches training)
+    gaussian_blur = get_gaussian_layer(channels=1, sigma=0.8, device=device)
+    gaussian_blur.eval()
+    
+    # Create Gaussian filter for CPU baseline (sigma=1.0 for MC denoising)
+    gaussian_baseline = get_gaussian_layer(channels=1, sigma=1.0, device=device)
+    gaussian_baseline.eval()
+    
     # =========================================================================
     # Results Storage
     # =========================================================================
     unet_results = []
     gaussian_results = []
-    bilateral_results = []
     lp_baseline_results = []  # LP without any processing
     
     num_samples = min(args.num_samples, len(dataset_norm)) if args.num_samples > 0 else len(dataset_norm)
@@ -381,27 +366,40 @@ def test(args):
             
             # =================================================================
             # Model Prediction (on normalized input)
+            # RESIDUAL LEARNING with SIGNAL AMPLIFICATION on GAUSSIAN baseline
+            # Training used target = (HP - Gaussian(LP)) * residual_scale
+            # So here: Pred = Gaussian(LP) + Model_Output / residual_scale
             # =================================================================
             inputs_norm = torch.cat([ct_norm.unsqueeze(0), lp_norm.unsqueeze(0)], dim=1).to(device)
-            pred_norm = model(inputs_norm)
+            
+            # 1. Get scaled residual from model
+            pred_scaled_residual = model(inputs_norm)
+            
+            # 2. Scale back to normalized dose space
+            pred_residual = pred_scaled_residual / float(args.residual_scale)
+            
+            # 3. Apply Gaussian blur to LP to get baseline (matches training)
+            lp_norm_batch = lp_norm.unsqueeze(0).to(device)
+            with torch.no_grad():
+                lp_gaussian_norm = gaussian_blur(lp_norm_batch)
+            
+            # 4. Add correction to Gaussian baseline
+            pred_norm = lp_gaussian_norm + pred_residual
             pred_norm_np = pred_norm[0, 0].cpu().numpy()
             
             # =================================================================
             # UN-NORMALIZE prediction to physical dose
             # 
-            # Problem: Model output is in normalized space [-2, +3] roughly
-            # Solution: Map back to physical dose range
-            # 
-            # Method: Linear mapping from normalized to raw range
+            # NEW NORMALIZATION: Dose is scaled to [0, 1] using global max
+            # Un-scale: x_physical = x_normalized * max_dose_global
             # =================================================================
             hp_norm_np = hp_norm.squeeze().numpy()
             
-            # Get normalization stats from raw data
-            hp_mean = hp_raw.mean()
-            hp_std = hp_raw.std() + 1e-10
+            # Use the same global max as in training
+            max_dose_global = float(args.dose_scale)  # Must match dataset normalization!
             
-            # Un-normalize: x_raw = x_norm * std + mean
-            pred_raw = (pred_norm_np * hp_std) + hp_mean
+            # Un-normalize: Scale back from [0,1] to physical units
+            pred_raw = pred_norm_np * max_dose_global
             pred_raw = np.maximum(pred_raw, 0)  # Dose must be >= 0
             
             # =================================================================
@@ -411,17 +409,12 @@ def test(args):
             unet_results.append(unet_metrics)
             
             # =================================================================
-            # Classical Filter Baselines (on RAW LP)
+            # Classical Filter Baselines (on RAW LP) - GPU ACCELERATED
             # =================================================================
-            # Gaussian filter (sigma=1.0, typical for MC denoising)
-            lp_gaussian = apply_gaussian_filter(lp_raw, sigma=args.gaussian_sigma)
+            # Gaussian filter (sigma=1.0, typical for MC denoising) - ON GPU!
+            lp_gaussian = apply_gaussian_filter_gpu(lp_raw_tensor, gaussian_baseline, device)
             gaussian_metrics = compute_all_metrics(hp_raw, lp_gaussian, lp_raw)
             gaussian_results.append(gaussian_metrics)
-            
-            # Bilateral filter (edge-preserving)
-            lp_bilateral = apply_bilateral_filter_approx(lp_raw, sigma_spatial=1.0)
-            bilateral_metrics = compute_all_metrics(hp_raw, lp_bilateral, lp_raw)
-            bilateral_results.append(bilateral_metrics)
             
             # LP baseline (no processing)
             lp_baseline_metrics = compute_all_metrics(hp_raw, lp_raw, lp_raw)
@@ -436,7 +429,6 @@ def test(args):
             print(f"  {'-'*48}")
             print(f"  {'LP (raw)':<12} {lp_baseline_metrics['rmse']:<12.6f} {lp_baseline_metrics['psnr']:<12.2f} {lp_baseline_metrics['gamma_11']:<12.2f}")
             print(f"  {'Gaussian':<12} {gaussian_metrics['rmse']:<12.6f} {gaussian_metrics['psnr']:<12.2f} {gaussian_metrics['gamma_11']:<12.2f}")
-            print(f"  {'Bilateral':<12} {bilateral_metrics['rmse']:<12.6f} {bilateral_metrics['psnr']:<12.2f} {bilateral_metrics['gamma_11']:<12.2f}")
             print(f"  {'U-Net':<12} {unet_metrics['rmse']:<12.6f} {unet_metrics['psnr']:<12.2f} {unet_metrics['gamma_11']:<12.2f}")
             
             # Dose Regime Analysis
@@ -475,9 +467,6 @@ def test(args):
     # Gaussian
     print(f"{'Gaussian':<12} {avg(gaussian_results, 'rmse'):<14.6f} {avg(gaussian_results, 'mae'):<14.6f} {avg(gaussian_results, 'psnr'):<14.2f} {avg(gaussian_results, 'gamma_33'):<12.2f} {avg(gaussian_results, 'gamma_11'):<12.2f}")
     
-    # Bilateral
-    print(f"{'Bilateral':<12} {avg(bilateral_results, 'rmse'):<14.6f} {avg(bilateral_results, 'mae'):<14.6f} {avg(bilateral_results, 'psnr'):<14.2f} {avg(bilateral_results, 'gamma_33'):<12.2f} {avg(bilateral_results, 'gamma_11'):<12.2f}")
-    
     # U-Net
     print(f"{'U-Net':<12} {avg(unet_results, 'rmse'):<14.6f} {avg(unet_results, 'mae'):<14.6f} {avg(unet_results, 'psnr'):<14.2f} {avg(unet_results, 'gamma_33'):<12.2f} {avg(unet_results, 'gamma_11'):<12.2f}")
     
@@ -515,13 +504,11 @@ def test(args):
     lp_rmse = avg(lp_baseline_results, 'rmse')
     unet_rmse = avg(unet_results, 'rmse')
     gauss_rmse = avg(gaussian_results, 'rmse')
-    bilat_rmse = avg(bilateral_results, 'rmse')
     
     if lp_rmse > 0:
         print(f"\nRMSE Reduction:")
         print(f"  vs LP (raw):    {(1 - unet_rmse/lp_rmse)*100:.1f}%")
         print(f"  vs Gaussian:    {(1 - unet_rmse/gauss_rmse)*100:.1f}%")
-        print(f"  vs Bilateral:   {(1 - unet_rmse/bilat_rmse)*100:.1f}%")
     
     lp_psnr = avg(lp_baseline_results, 'psnr')
     unet_psnr = avg(unet_results, 'psnr')
@@ -542,17 +529,26 @@ def test(args):
     print(f"""
     LP input source: pre-generated dose cubes from folder '{args.lp_folder}'.
 
-    IMPORTANT: In this codebase the LP dose is generated by injecting voxel-wise
-    Poisson noise into the HP dose (synthetic low-photon approximation):
+    IMPORTANT: The LP dose in this package is generated using the δ-based
+    Poisson formulation discussed in our meeting (per-voxel particle counting):
 
-        LP = Poisson(HP * N) / N
+        δ      = (max_dose) / N_eff
+        n      = D / δ
+        n'     ~ Poisson(n)
+        D_lp   = n' · δ
 
-    Here, N is an effective scaling parameter controlling the noise level.
-    It is NOT necessarily equal to a true Monte Carlo source-particle history count.
-    The noise level scales approximately as sqrt(HP / N).
+    where D is the clean (HP) voxel dose, δ is the dose-per-particle, and N_eff
+    is an *effective* particle count at the max-dose voxel. This is a synthetic
+    low-photon approximation; N_eff is not necessarily the true Geant4 history count.
 
-    If '{args.lp_folder}' encodes N in its name (e.g., 'lp_cubes_100'), then that
-    N was used during the pre-generation step (generate_lp_dose.py).
+    If '{args.lp_folder}' encodes N_eff in its name (e.g., 'lp_cubes_100'), that
+    value was used during the pre-generation step (generate_lp_dose.py).
+
+    Model training detail:
+      - Strategy: Learn correction on top of Gaussian-filtered baseline (Prof. Hesser)
+      - The network predicts: (HP - Gaussian(LP)) * {args.residual_scale}
+      - Inference uses: Gaussian(LP) + (model_output / {args.residual_scale})
+      - Gaussian sigma: 0.8 (applied in normalized space)
     """)
 
 
@@ -563,6 +559,10 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="results/hesser_evaluation")
     parser.add_argument("--lp_folder", type=str, default="lp_cubes",
                         help="LP dose folder name (e.g., lp_cubes or lp_cubes_100)")
+    parser.add_argument("--dose_scale", type=float, default=0.02,
+                        help="Global dose scale used for normalization (raw_dose / dose_scale -> [0,1])")
+    parser.add_argument("--residual_scale", type=float, default=1000.0,
+                        help="Scale factor used during residual training/inference")
     parser.add_argument("--gaussian_sigma", type=float, default=0.8,
                         help="Sigma for Gaussian baseline (use 0.8 for N=100 baseline)")
     parser.add_argument("--device", type=str, default="cpu")
