@@ -1,8 +1,15 @@
 # ============================================================================
 # utils/gamma_index.py
 # ============================================================================
-# Purpose: Calculate Gamma Index for Dose Distributions.
-#          Standard metric in Medical Physics (e.g., 3%/3mm).
+# WARNING: This module implements a DOSE-DIFFERENCE-ONLY approximation.
+#          It does NOT include Distance-To-Agreement (DTA).
+#          The dta_mm and pixel_spacing_mm parameters are ACCEPTED but IGNORED.
+#
+#          DO NOT report results from this module as "Gamma X%/Xmm" in any
+#          publication — that name implies DTA is included.
+#
+#          For proper Gamma (DTA+DD), use pymedphys.gamma() instead.
+#          See: evaluate_gamma_proper.py, honest_evaluation.py
 # ============================================================================
 
 import numpy as np
@@ -16,26 +23,24 @@ def calculate_gamma_index_3d(
     threshold_percent=10.0
 ):
     """
-    FAST Gamma Index calculation (Dose-Difference only approximation).
+    FAST **Dose-Difference-only** approximation (NOT full Gamma).
     
-    The full 3D Gamma with DTA is extremely slow on CPU.
-    This uses a dose-difference-only approximation which is:
-    - Much faster (numpy vectorized)
-    - Conservative (underestimates pass rate slightly)
-    - Suitable for training/validation feedback
+    ⚠️  DTA IS NOT USED.  dta_mm and pixel_spacing_mm are accepted for
+    API compatibility but silently ignored.  Results should be reported
+    as "DD-only X%" and NEVER as "Gamma X%/Xmm".
     
-    For final publication results, use pymedphys.gamma separately.
+    For publication-quality Gamma with DTA, use pymedphys.gamma().
     
     Args:
         reference (np.ndarray): Reference dose (Ground Truth).
         evaluated (np.ndarray): Evaluated dose (Prediction).
-        dta_mm (float): Distance-to-Agreement threshold in mm (not used in fast mode).
+        dta_mm (float): **IGNORED** — kept for API compatibility.
         dd_percent (float): Dose Difference threshold in % (default 3%).
-        pixel_spacing_mm (tuple): Voxel size in mm (not used in fast mode).
+        pixel_spacing_mm (tuple): **IGNORED** — kept for API compatibility.
         threshold_percent (float): Lower dose threshold to exclude background.
         
     Returns:
-        gamma_map (np.ndarray): Approximate Gamma map (DD-only).
+        gamma_map (np.ndarray): DD-only approximate Gamma map.
         pass_rate (float): Percentage of points with Gamma <= 1.
     """
     max_dose = np.max(reference)

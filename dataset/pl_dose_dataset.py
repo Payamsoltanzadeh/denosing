@@ -140,19 +140,52 @@ def add_poisson_noise(clean_dose: np.ndarray,
     return noisy_dose
 
 
+def get_patient_id_from_filename(filename: str, patches_per_patient: int = 200) -> int:
+    """
+    Extract patient ID from filename based on patch index.
+    
+    Per Marcus Buchwald (Jan 30, 2026):
+        - Each folder contains 10 patients × 200 patches = 2000 patches
+        - Patches 0-199 = Patient 0
+        - Patches 200-399 = Patient 1
+        - etc.
+    
+    Filename format: {folder_id}_{patch_index}.npy
+    Example: 277818358016850894820204297874963333096_181.npy → patch 181 → Patient 0
+    """
+    # Extract patch index from filename (after last underscore, before .npy)
+    basename = os.path.splitext(filename)[0]  # Remove .npy
+    parts = basename.rsplit('_', 1)  # Split from right on last underscore
+    
+    if len(parts) == 2:
+        try:
+            patch_index = int(parts[1])
+            patient_id = patch_index // patches_per_patient
+            return patient_id
+        except ValueError:
+            return -1
+    return -1
+
+
 class ConditionalDoseDataset(Dataset):
     # ========================================================================
     # Date: 2025-12-03
     # Changes: Added use_pregenerated_lp parameter
     # Date: 2025-12-26
     # Changes: Replaced num_photons with delta and target_uncertainty
-    # Why: Support both pre-generated LP (reproducible) and on-the-fly LP
-    #      Using Prof. Hesser's delta formulation instead of num_photons
+    # Date: 2026-01-30
+    # Changes: Added patient-aware splitting to prevent data leakage
+    # Date: 2026-02-03
+    # Changes: Added FOLDER-LEVEL splitting (folder_names parameter)
+    # Why: Per Marcus Buchwald - each folder is independent simulation
+    #      Must split by folder to prevent data leakage between train/test!
     # ========================================================================
     def __init__(self, root_dir, normalize=True, target_dim=None,
                  delta=None, target_uncertainty=0.10, add_noise=True,
                  use_pregenerated_lp=True, lp_folder: str = "lp_cubes",
-                 dose_scale: float = 0.02):
+                 dose_scale: float = 0.02,
+                 patient_ids: list = None, patches_per_patient: int = 200,
+                 folder_names: list = None, augment: bool = False):
         """
         Diff-MC style dataset for Monte Carlo dose denoising.
         
@@ -174,6 +207,16 @@ class ConditionalDoseDataset(Dataset):
             lp_folder: Folder name under each batch directory that contains LP dose
                        volumes (default: "lp_cubes"). Useful for variants like
                        "lp_cubes_100".
+            patient_ids: List of patient IDs to include (0-9). If None, include all.
+                        (DEPRECATED - use folder_names for proper folder-level split)
+            patches_per_patient: Number of patches per patient (default: 200)
+            folder_names: List of folder names to include. If None, include all.
+                         Use this for folder-level train/val/test splits:
+                           - Train: first 7 folders (70% = 14,000 patches)
+                           - Val:   next 2 folders (20% = 4,000 patches)
+                           - Test:  last 1 folder (10% = 2,000 patches)
+            augment: If True, apply random 3D flips for data augmentation.
+                     Only use for training — not for val/test.
         """
         super().__init__()
         self.data = []
@@ -185,6 +228,10 @@ class ConditionalDoseDataset(Dataset):
         self.use_pregenerated_lp = use_pregenerated_lp  # Date: 2025-12-03
         self.lp_folder = lp_folder
         self.dose_scale = float(dose_scale)
+        self.patient_ids = patient_ids  # DEPRECATED: use folder_names
+        self.patches_per_patient = patches_per_patient
+        self.folder_names = folder_names  # NEW: Filter by folder
+        self.augment = augment  # NEW: 3D random flips (2026-02-14)
 
         # ====================================================================
         # Date: 2026-01-06: Support FLAT structure (patient_id/input_cubes)
@@ -195,6 +242,11 @@ class ConditionalDoseDataset(Dataset):
         # ====================================================================
         patient_folders = sorted(os.listdir(root_dir))
         for patient_folder in tqdm(patient_folders, desc="Indexing dataset"):
+            # NEW: Filter by folder name if specified (folder-level split)
+            if self.folder_names is not None:
+                if patient_folder not in self.folder_names:
+                    continue  # Skip folders not in the list
+            
             patient_path = os.path.join(root_dir, patient_folder)
             
             if not os.path.isdir(patient_path):
@@ -212,6 +264,13 @@ class ConditionalDoseDataset(Dataset):
                 input_files = sorted(glob.glob(os.path.join(input_path, "*.npy")))
                 for file in input_files:
                     filename = os.path.basename(file)
+                    
+                    # NEW: Filter by patient ID if specified
+                    if self.patient_ids is not None:
+                        patient_id = get_patient_id_from_filename(filename, self.patches_per_patient)
+                        if patient_id not in self.patient_ids:
+                            continue  # Skip patches from excluded patients
+                    
                     ct_file = os.path.join(input_path, filename)
                     hp_file = os.path.join(output_path, filename)
                     lp_file = os.path.join(lp_path, filename)
@@ -307,8 +366,22 @@ class ConditionalDoseDataset(Dataset):
         else:
             # No noise (for testing/ablation)
             lp_dose = hp_dose.copy()
-        
-            # ====================================================================
+
+        # ====================================================================
+        # Data Augmentation (2026-02-14)
+        # Random 3D flips along each axis independently.
+        # Dose is a scalar field, so flips are physically valid.
+        # Gives up to 8× effective dataset size.
+        # Applied BEFORE normalization to avoid any ordering issues.
+        # ====================================================================
+        if self.augment:
+            for axis in range(3):  # D, H, W
+                if np.random.random() > 0.5:
+                    ct_vol = np.flip(ct_vol, axis=axis).copy()
+                    hp_dose = np.flip(hp_dose, axis=axis).copy()
+                    lp_dose = np.flip(lp_dose, axis=axis).copy()
+
+        # ====================================================================
         # Normalize each volume (z-score normalization)
         # IMPORTANT: Store normalization stats for un-normalization in testing
         # 
@@ -376,8 +449,23 @@ class ConditionalDoseDataset(Dataset):
 
 
 class DoseDataModule(pl.LightningDataModule):
+    """
+    DEPRECATED — DO NOT USE.
+    
+    This class uses random_split() which splits by SAMPLE, not by FOLDER,
+    causing patient-level DATA LEAKAGE between train/val/test sets.
+    
+    Use ConditionalDoseDataset with folder_names= parameter instead.
+    See simple_train_denoising.py for the correct folder-level split.
+    """
     def __init__(self, root_dir, batch_size=4, num_workers=4, split=(0.8, 0.1, 0.1), target_dim=None):
         super().__init__()
+        import warnings
+        warnings.warn(
+            "DoseDataModule is DEPRECATED due to data leakage (random split, not folder-level). "
+            "Use ConditionalDoseDataset with folder_names= parameter instead.",
+            DeprecationWarning, stacklevel=2
+        )
         assert sum(split) == 1.0, "Splits must sum to 1."
         self.root_dir = root_dir
         self.batch_size = batch_size

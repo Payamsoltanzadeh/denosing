@@ -175,13 +175,19 @@ class SimpleUNetDenoiser(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Standard forward pass: Predicts HP dose directly.
+        Standard forward pass: Predicts residual correction.
+        
+        NOTE: No ReLU here! The residual target = (HP - Gaussian(LP)) * 1000
+        can be negative (when Gaussian oversmooths). ReLU would clip these
+        to zero, creating a systematic positive bias.
+        The final dose is computed in the training/inference script as:
+            pred_dose = Gaussian(LP) + pred_residual / 1000
         """
         features = self.forward_features(x)
         out = self.output_conv(features)
         
-        # Apply ReLU to ensure non-negative dose
-        return F.relu(out)
+        # No activation — residual can be positive or negative
+        return out
     
     def count_parameters(self) -> int:
         """Count total number of trainable parameters."""
@@ -190,31 +196,35 @@ class SimpleUNetDenoiser(nn.Module):
 
 class SimpleUNetDenoiserWithResidual(SimpleUNetDenoiser):
     """
-    Simple U-Net with residual learning.
+    DEPRECATED — kept for backward compatibility only.
     
-    Instead of predicting HP directly, predicts the residual:
+    Simple U-Net with LP-additive residual learning:
         HP_pred = LP + residual
     
-    This can help when LP and HP are similar (low noise case).
+    NOTE: The current training pipeline uses SimpleUNetDenoiser ("standard")
+    with an EXTERNAL Gaussian-blur residual strategy:
+        HP_pred = Gaussian(LP) + model_output / residual_scale
+    This class does something DIFFERENT and is NOT recommended.
+    
+    WARNING: No ReLU on final output — dose can go negative, which is
+    non-physical but avoids asymmetric clipping of the residual.
+    Use np.maximum(pred, 0) at inference time if needed.
     """
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Residual forward pass.
+        Residual forward pass: pred = LP + network_output.
+        No activation — residual can be positive or negative.
         """
         # Extract LP dose (channel 1)
         lp_dose = x[:, 1:2, ...]  # Shape: (B, 1, D, H, W)
         
         # Get features and predict residual
-        # Note: Residual can be negative (to subtract noise), so NO ReLU on raw output
         features = self.forward_features(x)
         residual = self.output_conv(features)
         
-        # Add residual to LP to get HP
-        y = lp_dose + residual
-        
-        # Apply ReLU to final dose (dose >= 0)
-        return F.relu(y)
+        # Add residual to LP to get HP (no ReLU — dose clamp at inference)
+        return lp_dose + residual
 
 
 # ============================================================================

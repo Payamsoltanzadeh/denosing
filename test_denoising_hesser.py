@@ -30,7 +30,7 @@ from scipy.ndimage import gaussian_filter, median_filter
 # Import Model and Dataset
 from models.simple_unet_denoiser import get_simple_denoiser
 from dataset.pl_dose_dataset import ConditionalDoseDataset
-from utils.gamma_index import calculate_gamma_index_3d
+from utils.gamma_index import calculate_gamma_index_3d  # WARNING: DD-only, no DTA!
 from utils.torch_gaussian import get_gaussian_layer
 
 
@@ -174,6 +174,9 @@ def compute_all_metrics(hp_raw, pred_raw, lp_raw):
     psnr_lp = compute_psnr(hp_raw, lp_raw)  # Baseline PSNR
     
     # Gamma Index (on physical dose)
+    # WARNING: This uses DD-only gamma_index.py (DTA is NOT included).
+    # Results should be reported as "DD-only X%", NOT "Gamma X%/Xmm".
+    # For proper Gamma with DTA, use pymedphys via honest_evaluation.py.
     try:
         _, gamma_33 = calculate_gamma_index_3d(hp_raw, pred_raw, dta_mm=3.0, dd_percent=3.0)
         _, gamma_22 = calculate_gamma_index_3d(hp_raw, pred_raw, dta_mm=2.0, dd_percent=2.0)
@@ -273,59 +276,104 @@ def test(args):
     # CRITICAL: Load TWO versions of dataset
     # 1. NORMALIZED - for model input (model trained on normalized data)
     # 2. RAW - for metrics calculation (physical dose units)
+    #
+    # FOLDER-LEVEL SPLIT (Fixed: 2026-02-03)
+    # Per Marcus Buchwald: Each folder is independent simulation
+    # Test ONLY on last 3 folders (never seen during training!)
     # =========================================================================
+    ALL_FOLDERS = sorted([
+        "132102389758881090179672567372987664560",
+        "156339165372145091992366212553627308160",
+        "169178663511657097619787299759624979616",
+        "226808136684964871480153898846429021344",
+        "235101017859661465075472232303048949736",
+        "277818358016850894820204297874963333096",
+        "40001034793533568458224025980056277120",
+        "40838398986272789027252987369168472240",
+        "62242424098194756750821789925294112700",
+        "73631120845087000785006921692554887100",
+    ])
+    TEST_FOLDERS = ALL_FOLDERS[8:]  # Last 2 folders (20%)
     
     print("\n📂 Loading datasets...")
+    print(f"   ⚠️  FOLDER-LEVEL TESTING: Testing on {len(TEST_FOLDERS)} folders (4000 patches, 20 patients)")
+    print(f"   These folders were NEVER seen during training!")
+    print(f"   ⚠️  FOLDER-LEVEL TESTING: Only folder {TEST_FOLDERS[0][:20]}...")
+    print(f"   This folder (10 patients, 2000 patches) was NEVER seen during training!")
     
     # Dataset for MODEL INPUT (normalized)
     dataset_norm = ConditionalDoseDataset(
         root_dir=args.root_dir,
         normalize=True,  # Model expects normalized input
-        target_dim=64,
+        target_dim=32,  # Match actual data size (32x32x32)
         delta=None,
         target_uncertainty=0.10,
         add_noise=False,
         use_pregenerated_lp=True,
         lp_folder=args.lp_folder,
         dose_scale=args.dose_scale,
+        folder_names=TEST_FOLDERS,  # NEW: Folder-level split
     )
     
     # Dataset for METRICS (raw, physical units)
     dataset_raw = ConditionalDoseDataset(
         root_dir=args.root_dir,
         normalize=False,  # RAW physical dose for metrics!
-        target_dim=64,
+        target_dim=32,  # Match actual data size (32x32x32)
         delta=None,
         target_uncertainty=0.10,
         add_noise=False,
         use_pregenerated_lp=True,
         lp_folder=args.lp_folder,
         dose_scale=args.dose_scale,
+        folder_names=TEST_FOLDERS,  # NEW: Folder-level split
     )
     
-    print(f"   Loaded {len(dataset_norm)} samples")
+    print(f"   Loaded {len(dataset_norm)} test samples (1 folder = 10 patients = 2000 patches)")
     
     # =========================================================================
     # Load Model
+    # Read base_channels, gaussian_sigma, residual_scale from checkpoint
+    # so the test script is always consistent with whatever was trained.
     # =========================================================================
     print(f"\n🏗️ Loading model from: {args.model_path}")
+    
+    if os.path.exists(args.model_path):
+        checkpoint = torch.load(args.model_path, map_location=device, weights_only=False)
+        # Read training args from checkpoint (if available)
+        saved_args = checkpoint.get('args', {}) if isinstance(checkpoint, dict) else {}
+        base_channels = saved_args.get('base_channels', args.base_channels)
+        gaussian_sigma = saved_args.get('gaussian_sigma', args.gaussian_sigma)
+        residual_scale = saved_args.get('residual_scale', args.residual_scale)
+        print(f"   Checkpoint args: base_channels={base_channels}, "
+              f"gaussian_sigma={gaussian_sigma}, residual_scale={residual_scale}")
+    else:
+        base_channels = args.base_channels
+        gaussian_sigma = args.gaussian_sigma
+        residual_scale = args.residual_scale
+    
     model = get_simple_denoiser(
         model_type=args.model_type,
-        base_channels=args.base_channels
+        base_channels=base_channels
     ).to(device)
     
     if os.path.exists(args.model_path):
-        checkpoint = torch.load(args.model_path, map_location=device)
-        model.load_state_dict(checkpoint)
-        print("   ✅ Model loaded successfully")
+        # Handle different checkpoint formats
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"   ✅ Model loaded (epoch {checkpoint.get('epoch', '?')})")
+        else:
+            model.load_state_dict(checkpoint)
+            print("   ✅ Model loaded successfully")
     else:
         print(f"   ❌ Model not found! Using random weights.")
     
     model.eval()
     
     # Create Gaussian blur layer for inference (matches training)
-    gaussian_blur = get_gaussian_layer(channels=1, sigma=0.8, device=device)
+    gaussian_blur = get_gaussian_layer(channels=1, sigma=gaussian_sigma, device=device)
     gaussian_blur.eval()
+    print(f"   Gaussian blur sigma: {gaussian_sigma}")
     
     # Create Gaussian filter for CPU baseline (sigma=1.0 for MC denoising)
     gaussian_baseline = get_gaussian_layer(channels=1, sigma=1.0, device=device)
@@ -376,7 +424,7 @@ def test(args):
             pred_scaled_residual = model(inputs_norm)
             
             # 2. Scale back to normalized dose space
-            pred_residual = pred_scaled_residual / float(args.residual_scale)
+            pred_residual = pred_scaled_residual / float(residual_scale)
             
             # 3. Apply Gaussian blur to LP to get baseline (matches training)
             lp_norm_batch = lp_norm.unsqueeze(0).to(device)
@@ -567,7 +615,8 @@ if __name__ == "__main__":
                         help="Sigma for Gaussian baseline (use 0.8 for N=100 baseline)")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--model_type", type=str, default="standard")
-    parser.add_argument("--base_channels", type=int, default=32)
+    parser.add_argument("--base_channels", type=int, default=64,
+                        help="Model base channels (overridden by checkpoint if available)")
     parser.add_argument("--num_samples", type=int, default=10, help="Number of samples (0 for all)")
     
     args = parser.parse_args()
